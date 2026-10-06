@@ -1,0 +1,33 @@
+diff --git a/src/com/android/se/Terminal.java b/src/com/android/se/Terminal.java
+index d338cf8..687b993 100644
+--- a/src/com/android/se/Terminal.java
++++ b/src/com/android/se/Terminal.java
+@@ -114,7 +114,7 @@ public class Terminal {
+     private ISecureElementHalCallback.Stub mHalCallback = new ISecureElementHalCallback.Stub() {
+         @Override
+         public void onStateChange(boolean state) {
+-            stateChange(state, "");
++            mHandler.post(() -> stateChange(state, ""));
+         }
+     };
+ 
+@@ -122,7 +122,7 @@ public class Terminal {
+             new android.hardware.secure_element.V1_1.ISecureElementHalCallback.Stub() {
+         @Override
+         public void onStateChange_1_1(boolean state, String reason) {
+-            stateChange(state, reason);
++            mHandler.post(() -> stateChange(state, reason));
+         }
+ 
+         public void onStateChange(boolean state) {
+@@ -130,6 +130,10 @@ public class Terminal {
+         }
+     };
+ 
++    // HAL init may synchronously call back while initialize() holds mLock.
++    // Return from that callback before taking mLock or calling the HAL again
++    // to close channels and load access rules. Use the initialization handler
++    // to preserve the order of state notifications.
+     private void stateChange(boolean state, String reason) {
+         synchronized (mLock) {
+             Log.i(mTag, "OnStateChange:" + state + " reason:" + reason);

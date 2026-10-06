@@ -1,0 +1,2742 @@
+diff --git a/src/java/com/android/internal/telephony/RIL.java b/src/java/com/android/internal/telephony/RIL.java
+index 70431f6a0c..a7b21815b8 100644
+--- a/src/java/com/android/internal/telephony/RIL.java
++++ b/src/java/com/android/internal/telephony/RIL.java
+@@ -31,6 +31,7 @@ import android.net.KeepalivePacketData;
+ import android.net.LinkProperties;
+ import android.os.AsyncResult;
+ import android.os.Build;
++import android.os.DeadObjectException;
+ import android.os.Handler;
+ import android.os.HwBinder;
+ import android.os.IBinder;
+@@ -356,10 +357,7 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                     riljLog("handleMessage: EVENT_RADIO_PROXY_DEAD cookie = " + msg.obj
+                             + ", service = " + serviceToString(service) + ", service cookie = "
+                             + mServiceCookies.get(service));
+-                    if ((long) msg.obj == mServiceCookies.get(service).get()) {
+-                        mIsRadioProxyInitialized = false;
+-                        resetProxyAndRequestList(service);
+-                    }
++                    handleRadioProxyDeath((long) msg.obj);
+                     break;
+ 
+                 case EVENT_AIDL_PROXY_DEAD:
+@@ -369,7 +367,6 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                             + ", service = " + serviceToString(aidlService) + ", cookie = "
+                             + mServiceCookies.get(aidlService));
+                     if (obj.get() == mServiceCookies.get(aidlService).get()) {
+-                        mIsRadioProxyInitialized = false;
+                         resetProxyAndRequestList(aidlService);
+                     }
+                     break;
+@@ -451,16 +448,54 @@ public class RIL extends BaseCommands implements CommandsInterface {
+         }
+     }
+ 
++    @VisibleForTesting
++    synchronized void handleRadioProxyDeath(long cookie) {
++        if (cookie == mServiceCookies.get(RADIO_SERVICE).get()) {
++            resetProxyAndRequestList(RADIO_SERVICE);
++        }
++    }
++
++    private static RadioServiceProxy createRadioServiceProxy(int service) {
++        switch (service) {
++            case DATA_SERVICE: return new RadioDataProxy();
++            case MESSAGING_SERVICE: return new RadioMessagingProxy();
++            case MODEM_SERVICE: return new RadioModemProxy();
++            case NETWORK_SERVICE: return new RadioNetworkProxy();
++            case SIM_SERVICE: return new RadioSimProxy();
++            case VOICE_SERVICE: return new RadioVoiceProxy();
++            default: throw new IllegalArgumentException("Invalid radio service " + service);
++        }
++    }
++
+     private synchronized void resetProxyAndRequestList(int service) {
+-        if (service == RADIO_SERVICE) {
++        final boolean isHidl = service == RADIO_SERVICE
++                || !mServiceProxies.get(service).isAidl();
++        if (isHidl) {
++            // All HIDL services share one IRadio binder and one death notification cookie.
++            mServiceCookies.get(RADIO_SERVICE).incrementAndGet();
++            if (mRadioProxy != null) {
++                try {
++                    mRadioProxy.unlinkToDeath(mRadioProxyDeathRecipient);
++                } catch (RemoteException | NoSuchElementException e) {
++                    riljLoge("unlinkToDeath: " + e);
++                }
++            }
+             mRadioProxy = null;
++            mIsRadioProxyInitialized = false;
++            for (int i = 0; i < mServiceProxies.size(); i++) {
++                int id = mServiceProxies.keyAt(i);
++                RadioServiceProxy proxy = mServiceProxies.valueAt(i);
++                if (id != RADIO_SERVICE && !proxy.isAidl()) {
++                    // Replace the holder instead of clearing it under an in-flight request.
++                    // That request must continue to use the old binder, never the new one.
++                    mServiceProxies.setValueAt(i, createRadioServiceProxy(id));
++                }
++            }
+         } else {
+             mServiceProxies.get(service).clear();
++            mServiceCookies.get(service).incrementAndGet();
+         }
+ 
+-        // Increment the cookie so that death notification can be ignored
+-        mServiceCookies.get(service).incrementAndGet();
+-
+         // TODO: If a service doesn't exist or is unimplemented, it shouldn't cause the radio to
+         //  become unavailable for all other services
+         setRadioState(TelephonyManager.RADIO_POWER_UNAVAILABLE, true /* forceNotifyRegistrants */);
+@@ -672,10 +707,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+ 
+                 if (mRadioProxy != null) {
+                     if (!mIsRadioProxyInitialized) {
+-                        mIsRadioProxyInitialized = true;
+-                        mRadioProxy.linkToDeath(mRadioProxyDeathRecipient,
+-                                mServiceCookies.get(RADIO_SERVICE).incrementAndGet());
++                        if (!mRadioProxy.linkToDeath(mRadioProxyDeathRecipient,
++                                mServiceCookies.get(RADIO_SERVICE).incrementAndGet())) {
++                            throw new RemoteException("Unable to link HIDL radio death recipient");
++                        }
+                         mRadioProxy.setResponseFunctions(mRadioResponse, mRadioIndication);
++                        mIsRadioProxyInitialized = true;
+                     }
+                 } else {
+                     mDisabledRadioServices.get(RADIO_SERVICE).add(mPhoneId);
+@@ -685,6 +722,7 @@ public class RIL extends BaseCommands implements CommandsInterface {
+             }
+         } catch (RemoteException e) {
+             mRadioProxy = null;
++            mIsRadioProxyInitialized = false;
+             riljLoge("RadioProxy getService/setResponseFunctions: " + e);
+         }
+ 
+@@ -759,6 +797,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLoge("getRadioServiceProxy: " + serviceToString(service) + " for "
+                         + HIDL_SERVICE_NAME[mPhoneId] + " is disabled");
+             } else {
++                if (mRadioProxy != null && mMockModem == null
++                        && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
++                    serviceProxy.setHidl(mRadioVersion, mRadioProxy);
++                    return serviceProxy;
++                }
+                 IBinder binder;
+                 switch (service) {
+                     case DATA_SERVICE:
+@@ -854,72 +897,15 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+ 
+                 if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_6;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_6.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_5;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_5.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_4;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_4.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_3;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_3.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_2;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_2.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_1;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_1.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
+-                    }
+-                }
+-
+-                if (serviceProxy.isEmpty() && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
+-                    try {
+-                        mRadioVersion = RADIO_HAL_VERSION_1_0;
+-                        serviceProxy.setHidl(mRadioVersion,
+-                                android.hardware.radio.V1_0.IRadio.getService(
+-                                        HIDL_SERVICE_NAME[mPhoneId], true));
+-                    } catch (NoSuchElementException e) {
++                    // getRadioProxy owns HIDL version negotiation, death registration and
++                    // response callbacks. Service-specific holders only borrow its binder.
++                    IRadio radioProxy = getRadioProxy(null);
++                    if (radioProxy != null) {
++                        serviceProxy.setHidl(mRadioVersion, radioProxy);
++                    } else if (!mDisabledRadioServices.get(RADIO_SERVICE).contains(mPhoneId)) {
++                        // A transient registration failure must not permanently disable this
++                        // service holder; the next request can retry the shared connection.
++                        throw new RemoteException("HIDL radio connection is not ready");
+                     }
+                 }
+ 
+@@ -963,17 +949,8 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                                         mVoiceResponse, mVoiceIndication);
+                                 break;
+                         }
+-                    } else {
+-                        if (mRadioVersion.greaterOrEqual(RADIO_HAL_VERSION_2_0)) {
+-                            throw new AssertionError("serviceProxy shouldn't be HIDL with HAL 2.0");
+-                        }
+-                        if (!mIsRadioProxyInitialized) {
+-                            mIsRadioProxyInitialized = true;
+-                            serviceProxy.getHidl().linkToDeath(mRadioProxyDeathRecipient,
+-                                    mServiceCookies.get(service).incrementAndGet());
+-                            serviceProxy.getHidl().setResponseFunctions(
+-                                    mRadioResponse, mRadioIndication);
+-                        }
++                    } else if (mRadioVersion.greaterOrEqual(RADIO_HAL_VERSION_2_0)) {
++                        throw new AssertionError("serviceProxy shouldn't be HIDL with HAL 2.0");
+                     }
+                 } else {
+                     mDisabledRadioServices.get(service).add(mPhoneId);
+@@ -1001,7 +978,10 @@ public class RIL extends BaseCommands implements CommandsInterface {
+ 
+     @Override
+     public synchronized void onSlotActiveStatusChange(boolean active) {
+-        mIsRadioProxyInitialized = false;
++        if (!active && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
++            resetProxyAndRequestList(RADIO_SERVICE);
++            return;
++        }
+         for (int service = MIN_SERVICE_IDX; service <= MAX_SERVICE_IDX; service++) {
+             if (active) {
+                 // Try to connect to RIL services and set response functions.
+@@ -1085,12 +1065,9 @@ public class RIL extends BaseCommands implements CommandsInterface {
+             mServiceCookies.put(service, new AtomicLong(0));
+         }
+         if (proxies == null) {
+-            mServiceProxies.put(DATA_SERVICE, new RadioDataProxy());
+-            mServiceProxies.put(MESSAGING_SERVICE, new RadioMessagingProxy());
+-            mServiceProxies.put(MODEM_SERVICE, new RadioModemProxy());
+-            mServiceProxies.put(NETWORK_SERVICE, new RadioNetworkProxy());
+-            mServiceProxies.put(SIM_SERVICE, new RadioSimProxy());
+-            mServiceProxies.put(VOICE_SERVICE, new RadioVoiceProxy());
++            for (int service = DATA_SERVICE; service <= MAX_SERVICE_IDX; service++) {
++                mServiceProxies.put(service, createRadioServiceProxy(service));
++            }
+         } else {
+             mServiceProxies = proxies;
+         }
+@@ -1189,10 +1166,25 @@ public class RIL extends BaseCommands implements CommandsInterface {
+         return rr;
+     }
+ 
+-    private void handleRadioProxyExceptionForRR(int service, String caller, Exception e) {
++    private synchronized void handleRadioProxyExceptionForRR(
++            int service, String caller, Exception e, int serial) {
+         riljLoge(caller + ": " + e);
+         e.printStackTrace();
+-        mIsRadioProxyInitialized = false;
++        if (e instanceof DeadObjectException && mRadioVersion.less(RADIO_HAL_VERSION_2_0)) {
++            // The HIDL death recipient resets all holders. A late failure from an old
++            // binder must not reset the replacement connection and toggle radio power again.
++            // The request may have been queued after the death handler cleared the list,
++            // so fail this serial explicitly. ACKs have no request-list entry.
++            if (serial != -1) {
++                RILRequest rr = findAndRemoveRequestFromList(serial);
++                if (rr != null) {
++                    rr.onError(RADIO_NOT_AVAILABLE, null);
++                    decrementWakeLock(rr);
++                    rr.release();
++                }
++            }
++            return;
++        }
+         resetProxyAndRequestList(service);
+     }
+ 
+@@ -1207,10 +1199,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getIccCardStatus(rr.mSerial);
++                simProxy.getIccCardStatus(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getIccCardStatus", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getIccCardStatus", e, serial);
+             }
+         }
+     }
+@@ -1253,11 +1246,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.supplyIccPinForApp(rr.mSerial, RILUtils.convertNullToEmptyString(pin),
++                simProxy.supplyIccPinForApp(serial, RILUtils.convertNullToEmptyString(pin),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPinForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPinForApp", e, serial);
+             }
+         }
+     }
+@@ -1279,12 +1273,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " isPukEmpty = " + pukStr.isEmpty() + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.supplyIccPukForApp(rr.mSerial, pukStr,
++                simProxy.supplyIccPukForApp(serial, pukStr,
+                         RILUtils.convertNullToEmptyString(newPin),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPukForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPukForApp", e, serial);
+             }
+         }
+     }
+@@ -1306,11 +1301,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.supplyIccPin2ForApp(rr.mSerial, RILUtils.convertNullToEmptyString(pin),
++                simProxy.supplyIccPin2ForApp(serial, RILUtils.convertNullToEmptyString(pin),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPin2ForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPin2ForApp", e, serial);
+             }
+         }
+     }
+@@ -1332,12 +1328,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.supplyIccPuk2ForApp(rr.mSerial, RILUtils.convertNullToEmptyString(puk),
++                simProxy.supplyIccPuk2ForApp(serial, RILUtils.convertNullToEmptyString(puk),
+                         RILUtils.convertNullToEmptyString(newPin2),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPuk2ForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplyIccPuk2ForApp", e, serial);
+             }
+         }
+     }
+@@ -1359,13 +1356,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " oldPin = " + oldPin + " newPin = " + newPin + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.changeIccPinForApp(rr.mSerial,
++                simProxy.changeIccPinForApp(serial,
+                         RILUtils.convertNullToEmptyString(oldPin),
+                         RILUtils.convertNullToEmptyString(newPin),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "changeIccPinForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "changeIccPinForApp", e, serial);
+             }
+         }
+     }
+@@ -1387,13 +1385,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " oldPin = " + oldPin2 + " newPin = " + newPin2 + " aid = " + aid);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.changeIccPin2ForApp(rr.mSerial,
++                simProxy.changeIccPin2ForApp(serial,
+                         RILUtils.convertNullToEmptyString(oldPin2),
+                         RILUtils.convertNullToEmptyString(newPin2),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "changeIccPin2ForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "changeIccPin2ForApp", e, serial);
+             }
+         }
+     }
+@@ -1410,12 +1409,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " netpin = " + netpin);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.supplyNetworkDepersonalization(rr.mSerial,
++                networkProxy.supplyNetworkDepersonalization(serial,
+                         RILUtils.convertNullToEmptyString(netpin));
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(
+-                        NETWORK_SERVICE, "supplyNetworkDepersonalization", e);
++                        NETWORK_SERVICE, "supplyNetworkDepersonalization", e, serial);
+             }
+         }
+     }
+@@ -1434,11 +1434,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " controlKey = " + controlKey + " persoType" + persoType);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.supplySimDepersonalization(rr.mSerial, persoType,
++                simProxy.supplySimDepersonalization(serial, persoType,
+                         RILUtils.convertNullToEmptyString(controlKey));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplySimDepersonalization", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "supplySimDepersonalization", e, serial);
+             }
+         } else {
+             if (PersoSubState.PERSOSUBSTATE_SIM_NETWORK == persoType) {
+@@ -1467,10 +1468,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getCurrentCalls(rr.mSerial);
++                voiceProxy.getCurrentCalls(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCurrentCalls", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCurrentCalls", e, serial);
+             }
+         }
+     }
+@@ -1494,10 +1496,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + enable);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.enableModem(rr.mSerial, enable);
++                modemProxy.enableModem(serial, enable);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "enableModem", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "enableModem", e, serial);
+             }
+         } else {
+             if (RILJ_LOGV) riljLog("enableModem: not supported.");
+@@ -1523,10 +1526,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " setSystemSelectionChannels_1.3= " + specifiers);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setSystemSelectionChannels(rr.mSerial, specifiers);
++                networkProxy.setSystemSelectionChannels(serial, specifiers);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setSystemSelectionChannels", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setSystemSelectionChannels", e, serial);
+             }
+         } else {
+             if (RILJ_LOGV) riljLog("setSystemSelectionChannels: not supported.");
+@@ -1551,10 +1555,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " getSystemSelectionChannels");
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getSystemSelectionChannels(rr.mSerial);
++                networkProxy.getSystemSelectionChannels(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getSystemSelectionChannels", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getSystemSelectionChannels", e, serial);
+             }
+         } else {
+             if (RILJ_LOGV) riljLog("getSystemSelectionChannels: not supported.");
+@@ -1578,10 +1583,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getModemStackStatus(rr.mSerial);
++                modemProxy.getModemStackStatus(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getModemStatus", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getModemStatus", e, serial);
+             }
+         } else {
+             if (RILJ_LOGV) riljLog("getModemStatus: not supported.");
+@@ -1611,10 +1617,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.dial(rr.mSerial, address, clirMode, uusInfo);
++                voiceProxy.dial(serial, address, clirMode, uusInfo);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "dial", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "dial", e, serial);
+             }
+         }
+     }
+@@ -1632,11 +1639,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.emergencyDial(rr.mSerial, RILUtils.convertNullToEmptyString(address),
++                voiceProxy.emergencyDial(serial, RILUtils.convertNullToEmptyString(address),
+                         emergencyNumberInfo, hasKnownUserIntentEmergency, clirMode, uusInfo);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "emergencyDial", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "emergencyDial", e, serial);
+             }
+         } else {
+             riljLoge("emergencyDial is not supported with 1.4 below IRadio");
+@@ -1658,10 +1666,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + ">  " + RILUtils.requestToString(rr.mRequest)
+                         + " aid = " + aid);
+             }
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getImsiForApp(rr.mSerial, RILUtils.convertNullToEmptyString(aid));
++                simProxy.getImsiForApp(serial, RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getImsiForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getImsiForApp", e, serial);
+             }
+         }
+     }
+@@ -1677,10 +1686,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " gsmIndex = " + gsmIndex);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.hangup(rr.mSerial, gsmIndex);
++                voiceProxy.hangup(serial, gsmIndex);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "hangup", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "hangup", e, serial);
+             }
+         }
+     }
+@@ -1697,10 +1707,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.hangupWaitingOrBackground(rr.mSerial);
++                voiceProxy.hangupWaitingOrBackground(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "hangupWaitingOrBackground", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "hangupWaitingOrBackground", e, serial);
+             }
+         }
+     }
+@@ -1717,11 +1728,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.hangupForegroundResumeBackground(rr.mSerial);
++                voiceProxy.hangupForegroundResumeBackground(serial);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(
+-                        VOICE_SERVICE, "hangupForegroundResumeBackground", e);
++                        VOICE_SERVICE, "hangupForegroundResumeBackground", e, serial);
+             }
+         }
+     }
+@@ -1737,10 +1749,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.switchWaitingOrHoldingAndActive(rr.mSerial);
++                voiceProxy.switchWaitingOrHoldingAndActive(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "switchWaitingOrHoldingAndActive", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "switchWaitingOrHoldingAndActive", e, serial);
+             }
+         }
+     }
+@@ -1755,10 +1768,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.conference(rr.mSerial);
++                voiceProxy.conference(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "conference", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "conference", e, serial);
+             }
+         }
+     }
+@@ -1773,10 +1787,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.rejectCall(rr.mSerial);
++                voiceProxy.rejectCall(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "rejectCall", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "rejectCall", e, serial);
+             }
+         }
+     }
+@@ -1792,10 +1807,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getLastCallFailCause(rr.mSerial);
++                voiceProxy.getLastCallFailCause(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getLastCallFailCause", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getLastCallFailCause", e, serial);
+             }
+         }
+     }
+@@ -1811,10 +1827,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getSignalStrength(rr.mSerial);
++                networkProxy.getSignalStrength(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getSignalStrength", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getSignalStrength", e, serial);
+             }
+         }
+     }
+@@ -1835,10 +1852,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog("getVoiceRegistrationState: overrideHalVersion=" + overrideHalVersion);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getVoiceRegistrationState(rr.mSerial, overrideHalVersion);
++                networkProxy.getVoiceRegistrationState(serial, overrideHalVersion);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getVoiceRegistrationState", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getVoiceRegistrationState", e, serial);
+             }
+         }
+     }
+@@ -1859,10 +1877,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog("getDataRegistrationState: overrideHalVersion=" + overrideHalVersion);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getDataRegistrationState(rr.mSerial, overrideHalVersion);
++                networkProxy.getDataRegistrationState(serial, overrideHalVersion);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getDataRegistrationState", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getDataRegistrationState", e, serial);
+             }
+         }
+     }
+@@ -1877,10 +1896,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getOperator(rr.mSerial);
++                networkProxy.getOperator(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getOperator", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getOperator", e, serial);
+             }
+         }
+     }
+@@ -1899,11 +1919,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " preferredForEmergencyCall="  + preferredForEmergencyCall);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.setRadioPower(rr.mSerial, on, forEmergencyCall,
++                modemProxy.setRadioPower(serial, on, forEmergencyCall,
+                         preferredForEmergencyCall);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "setRadioPower", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "setRadioPower", e, serial);
+             }
+         }
+     }
+@@ -1919,10 +1940,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.sendDtmf(rr.mSerial, c + "");
++                voiceProxy.sendDtmf(serial, c + "");
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendDtmf", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendDtmf", e, serial);
+             }
+         }
+     }
+@@ -1939,12 +1961,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendSms(rr.mSerial, smscPdu, pdu);
+-                mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_GSM,
++                messagingProxy.sendSms(serial, smscPdu, pdu);
++                mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_GSM,
+                         SmsSession.Event.Format.SMS_FORMAT_3GPP, getOutgoingSmsMessageId(result));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendSMS", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendSMS", e, serial);
+             }
+         }
+     }
+@@ -1980,12 +2003,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendSmsExpectMore(rr.mSerial, smscPdu, pdu);
+-                mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_GSM,
++                messagingProxy.sendSmsExpectMore(serial, smscPdu, pdu);
++                mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_GSM,
+                         SmsSession.Event.Format.SMS_FORMAT_3GPP, getOutgoingSmsMessageId(result));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendSMSExpectMore", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendSMSExpectMore", e, serial);
+             }
+         }
+     }
+@@ -2011,12 +2035,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + ",matchAllRuleAllowed=" + matchAllRuleAllowed);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.setupDataCall(rr.mSerial, mPhoneId, accessNetworkType, dataProfile,
++                dataProxy.setupDataCall(serial, mPhoneId, accessNetworkType, dataProfile,
+                         isRoaming, allowRoaming, reason, linkProperties, pduSessionId, sliceInfo,
+                         trafficDescriptor, matchAllRuleAllowed);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "setupDataCall", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "setupDataCall", e, serial);
+             }
+         }
+     }
+@@ -2046,14 +2071,15 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.iccIoForApp(rr.mSerial, command, fileId,
++                simProxy.iccIoForApp(serial, command, fileId,
+                         RILUtils.convertNullToEmptyString(path), p1, p2, p3,
+                         RILUtils.convertNullToEmptyString(data),
+                         RILUtils.convertNullToEmptyString(pin2),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccIoForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccIoForApp", e, serial);
+             }
+         }
+     }
+@@ -2072,10 +2098,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " ussd = " + logUssd);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.sendUssd(rr.mSerial, RILUtils.convertNullToEmptyString(ussd));
++                voiceProxy.sendUssd(serial, RILUtils.convertNullToEmptyString(ussd));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendUssd", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendUssd", e, serial);
+             }
+         }
+     }
+@@ -2091,10 +2118,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.cancelPendingUssd(rr.mSerial);
++                voiceProxy.cancelPendingUssd(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "cancelPendingUssd", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "cancelPendingUssd", e, serial);
+             }
+         }
+     }
+@@ -2109,10 +2137,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getClir(rr.mSerial);
++                voiceProxy.getClir(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getClir", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getClir", e, serial);
+             }
+         }
+     }
+@@ -2128,10 +2157,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " clirMode = " + clirMode);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.setClir(rr.mSerial, clirMode);
++                voiceProxy.setClir(serial, clirMode);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setClir", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setClir", e, serial);
+             }
+         }
+     }
+@@ -2149,10 +2179,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " cfreason = " + cfReason + " serviceClass = " + serviceClass);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getCallForwardStatus(rr.mSerial, cfReason, serviceClass, number);
++                voiceProxy.getCallForwardStatus(serial, cfReason, serviceClass, number);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCallForwardStatus", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCallForwardStatus", e, serial);
+             }
+         }
+     }
+@@ -2171,11 +2202,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + serviceClass + " timeSeconds = " + timeSeconds);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+                 voiceProxy.setCallForward(
+-                        rr.mSerial, action, cfReason, serviceClass, number, timeSeconds);
++                        serial, action, cfReason, serviceClass, number, timeSeconds);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setCallForward", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setCallForward", e, serial);
+             }
+         }
+     }
+@@ -2192,10 +2224,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " serviceClass = " + serviceClass);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getCallWaiting(rr.mSerial, serviceClass);
++                voiceProxy.getCallWaiting(serial, serviceClass);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCallWaiting", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getCallWaiting", e, serial);
+             }
+         }
+     }
+@@ -2212,10 +2245,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + enable + " serviceClass = " + serviceClass);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.setCallWaiting(rr.mSerial, enable, serviceClass);
++                voiceProxy.setCallWaiting(serial, enable, serviceClass);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setCallWaiting", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setCallWaiting", e, serial);
+             }
+         }
+     }
+@@ -2233,11 +2267,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " success = " + success + " cause = " + cause);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.acknowledgeLastIncomingGsmSms(rr.mSerial, success, cause);
++                messagingProxy.acknowledgeLastIncomingGsmSms(serial, success, cause);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(MESSAGING_SERVICE,
+-                        "acknowledgeLastIncomingGsmSms", e);
++                        "acknowledgeLastIncomingGsmSms", e, serial);
+             }
+         }
+     }
+@@ -2252,11 +2287,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.acceptCall(rr.mSerial);
+-                mMetrics.writeRilAnswer(mPhoneId, rr.mSerial);
++                voiceProxy.acceptCall(serial);
++                mMetrics.writeRilAnswer(mPhoneId, serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "acceptCall", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "acceptCall", e, serial);
+             }
+         }
+     }
+@@ -2274,11 +2310,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + RILUtils.deactivateDataReasonToString(reason));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.deactivateDataCall(rr.mSerial, cid, reason);
+-                mMetrics.writeRilDeactivateDataCall(mPhoneId, rr.mSerial, cid, reason);
++                dataProxy.deactivateDataCall(serial, cid, reason);
++                mMetrics.writeRilDeactivateDataCall(mPhoneId, serial, cid, reason);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "deactivateDataCall", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "deactivateDataCall", e, serial);
+             }
+         }
+     }
+@@ -2303,13 +2340,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " appId = " + appId);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getFacilityLockForApp(rr.mSerial,
++                simProxy.getFacilityLockForApp(serial,
+                         RILUtils.convertNullToEmptyString(facility),
+                         RILUtils.convertNullToEmptyString(password),
+                         serviceClass, RILUtils.convertNullToEmptyString(appId));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getFacilityLockForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getFacilityLockForApp", e, serial);
+             }
+         }
+     }
+@@ -2334,13 +2372,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " serviceClass = " + serviceClass + " appId = " + appId);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setFacilityLockForApp(rr.mSerial,
++                simProxy.setFacilityLockForApp(serial,
+                         RILUtils.convertNullToEmptyString(facility), lockState,
+                         RILUtils.convertNullToEmptyString(password), serviceClass,
+                         RILUtils.convertNullToEmptyString(appId));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setFacilityLockForApp", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setFacilityLockForApp", e, serial);
+             }
+         }
+     }
+@@ -2359,13 +2398,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + "facility = " + facility);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setBarringPassword(rr.mSerial,
++                networkProxy.setBarringPassword(serial,
+                         RILUtils.convertNullToEmptyString(facility),
+                         RILUtils.convertNullToEmptyString(oldPwd),
+                         RILUtils.convertNullToEmptyString(newPwd));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "changeBarringPassword", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "changeBarringPassword", e, serial);
+             }
+         }
+     }
+@@ -2381,10 +2421,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getNetworkSelectionMode(rr.mSerial);
++                networkProxy.getNetworkSelectionMode(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getNetworkSelectionMode", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getNetworkSelectionMode", e, serial);
+             }
+         }
+     }
+@@ -2400,11 +2441,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setNetworkSelectionModeAutomatic(rr.mSerial);
++                networkProxy.setNetworkSelectionModeAutomatic(serial);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(
+-                        NETWORK_SERVICE, "setNetworkSelectionModeAutomatic", e);
++                        NETWORK_SERVICE, "setNetworkSelectionModeAutomatic", e, serial);
+             }
+         }
+     }
+@@ -2425,11 +2467,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " operatorNumeric = " + operatorNumeric + ", ran = " + ran);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setNetworkSelectionModeManual(rr.mSerial,
++                networkProxy.setNetworkSelectionModeManual(serial,
+                         RILUtils.convertNullToEmptyString(operatorNumeric), ran);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setNetworkSelectionModeManual", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setNetworkSelectionModeManual", e, serial);
+             }
+         }
+     }
+@@ -2445,10 +2488,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getAvailableNetworks(rr.mSerial);
++                networkProxy.getAvailableNetworks(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getAvailableNetworks", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getAvailableNetworks", e, serial);
+             }
+         }
+     }
+@@ -2476,11 +2520,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.startNetworkScan(rr.mSerial, networkScanRequest, overrideHalVersion,
++                networkProxy.startNetworkScan(serial, networkScanRequest, overrideHalVersion,
+                         result);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "startNetworkScan", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "startNetworkScan", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "startNetworkScan: REQUEST_NOT_SUPPORTED");
+@@ -2504,10 +2549,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.stopNetworkScan(rr.mSerial);
++                networkProxy.stopNetworkScan(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "stopNetworkScan", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "stopNetworkScan", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "stopNetworkScan: REQUEST_NOT_SUPPORTED");
+@@ -2530,10 +2576,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.startDtmf(rr.mSerial, c + "");
++                voiceProxy.startDtmf(serial, c + "");
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "startDtmf", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "startDtmf", e, serial);
+             }
+         }
+     }
+@@ -2548,10 +2595,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.stopDtmf(rr.mSerial);
++                voiceProxy.stopDtmf(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "stopDtmf", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "stopDtmf", e, serial);
+             }
+         }
+     }
+@@ -2568,10 +2616,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " gsmIndex = " + gsmIndex);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.separateConnection(rr.mSerial, gsmIndex);
++                voiceProxy.separateConnection(serial, gsmIndex);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "separateConnection", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "separateConnection", e, serial);
+             }
+         }
+     }
+@@ -2587,10 +2636,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getBasebandVersion(rr.mSerial);
++                modemProxy.getBasebandVersion(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getBasebandVersion", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getBasebandVersion", e, serial);
+             }
+         }
+     }
+@@ -2606,10 +2656,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enableMute = " + enableMute);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.setMute(rr.mSerial, enableMute);
++                voiceProxy.setMute(serial, enableMute);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setMute", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setMute", e, serial);
+             }
+         }
+     }
+@@ -2624,10 +2675,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getMute(rr.mSerial);
++                voiceProxy.getMute(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getMute", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getMute", e, serial);
+             }
+         }
+     }
+@@ -2642,10 +2694,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getClip(rr.mSerial);
++                voiceProxy.getClip(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getClip", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getClip", e, serial);
+             }
+         }
+     }
+@@ -2670,10 +2723,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.getDataCallList(rr.mSerial);
++                dataProxy.getDataCallList(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "getDataCallList", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "getDataCallList", e, serial);
+             }
+         }
+     }
+@@ -2701,10 +2755,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + enable);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setSuppServiceNotifications(rr.mSerial, enable);
++                networkProxy.setSuppServiceNotifications(serial, enable);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setSuppServiceNotifications", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setSuppServiceNotifications", e, serial);
+             }
+         }
+     }
+@@ -2722,12 +2777,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " " + status);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.writeSmsToSim(rr.mSerial, status,
++                messagingProxy.writeSmsToSim(serial, status,
+                         RILUtils.convertNullToEmptyString(smsc),
+                         RILUtils.convertNullToEmptyString(pdu));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "writeSmsToSim", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "writeSmsToSim", e, serial);
+             }
+         }
+     }
+@@ -2745,10 +2801,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " index = " + index);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.deleteSmsOnSim(rr.mSerial, index);
++                messagingProxy.deleteSmsOnSim(serial, index);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "deleteSmsOnSim", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "deleteSmsOnSim", e, serial);
+             }
+         }
+     }
+@@ -2764,10 +2821,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " bandMode = " + bandMode);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setBandMode(rr.mSerial, bandMode);
++                networkProxy.setBandMode(serial, bandMode);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setBandMode", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setBandMode", e, serial);
+             }
+         }
+     }
+@@ -2783,10 +2841,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getAvailableBandModes(rr.mSerial);
++                networkProxy.getAvailableBandModes(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "queryAvailableBandMode", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "queryAvailableBandMode", e, serial);
+             }
+         }
+     }
+@@ -2803,10 +2862,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " contents = " + contents);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.sendEnvelope(rr.mSerial, RILUtils.convertNullToEmptyString(contents));
++                simProxy.sendEnvelope(serial, RILUtils.convertNullToEmptyString(contents));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendEnvelope", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendEnvelope", e, serial);
+             }
+         }
+     }
+@@ -2824,11 +2884,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         ? contents : RILUtils.convertToCensoredTerminalResponse(contents)));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.sendTerminalResponseToSim(rr.mSerial,
++                simProxy.sendTerminalResponseToSim(serial,
+                         RILUtils.convertNullToEmptyString(contents));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendTerminalResponse", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendTerminalResponse", e, serial);
+             }
+         }
+     }
+@@ -2845,11 +2906,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " contents = " + contents);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.sendEnvelopeWithStatus(rr.mSerial,
++                simProxy.sendEnvelopeWithStatus(serial,
+                         RILUtils.convertNullToEmptyString(contents));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendEnvelopeWithStatus", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "sendEnvelopeWithStatus", e, serial);
+             }
+         }
+     }
+@@ -2865,10 +2927,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.explicitCallTransfer(rr.mSerial);
++                voiceProxy.explicitCallTransfer(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "explicitCallTransfer", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "explicitCallTransfer", e, serial);
+             }
+         }
+     }
+@@ -2887,11 +2950,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+             mAllowedNetworkTypesBitmask = RadioAccessFamily.getRafFromNetworkType(networkType);
+             mMetrics.writeSetPreferredNetworkType(mPhoneId, networkType);
+ 
++            final int serial = rr.mSerial;
+             try {
+                 networkProxy.setPreferredNetworkTypeBitmap(
+-                        rr.mSerial, mAllowedNetworkTypesBitmask, networkType);
++                        serial, mAllowedNetworkTypesBitmask, networkType);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setPreferredNetworkType", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setPreferredNetworkType", e, serial);
+             }
+         }
+     }
+@@ -2907,10 +2971,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getAllowedNetworkTypesBitmap(rr.mSerial);
++                networkProxy.getAllowedNetworkTypesBitmap(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getPreferredNetworkType", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getPreferredNetworkType", e, serial);
+             }
+         }
+     }
+@@ -2934,10 +2999,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+             }
+             mAllowedNetworkTypesBitmask = networkTypeBitmask;
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setAllowedNetworkTypesBitmap(rr.mSerial, mAllowedNetworkTypesBitmask);
++                networkProxy.setAllowedNetworkTypesBitmap(serial, mAllowedNetworkTypesBitmask);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setAllowedNetworkTypeBitmask", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setAllowedNetworkTypeBitmask", e, serial);
+             }
+         }
+     }
+@@ -2953,10 +3019,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getAllowedNetworkTypesBitmap(rr.mSerial);
++                networkProxy.getAllowedNetworkTypesBitmap(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getAllowedNetworkTypeBitmask", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getAllowedNetworkTypeBitmask", e, serial);
+             }
+         }
+     }
+@@ -2973,10 +3040,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + enable);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setLocationUpdates(rr.mSerial, enable);
++                networkProxy.setLocationUpdates(serial, enable);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setLocationUpdates", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setLocationUpdates", e, serial);
+             }
+         }
+     }
+@@ -2996,10 +3064,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.isNrDualConnectivityEnabled(rr.mSerial);
++                networkProxy.isNrDualConnectivityEnabled(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "isNrDualConnectivityEnabled", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "isNrDualConnectivityEnabled", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -3038,10 +3107,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + nrDualConnectivityState);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setNrDualConnectivityState(rr.mSerial, (byte) nrDualConnectivityState);
++                networkProxy.setNrDualConnectivityState(serial, (byte) nrDualConnectivityState);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "enableNrDualConnectivity", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "enableNrDualConnectivity", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "enableNrDualConnectivity: REQUEST_NOT_SUPPORTED");
+@@ -3077,10 +3147,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                     riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+                 }
+ 
++                final int serial = rr.mSerial;
+                 try {
+-                    voiceProxy.isVoNrEnabled(rr.mSerial);
++                    voiceProxy.isVoNrEnabled(serial);
+                 } catch (RemoteException | RuntimeException e) {
+-                    handleRadioProxyExceptionForRR(VOICE_SERVICE, "isVoNrEnabled", e);
++                    handleRadioProxyExceptionForRR(VOICE_SERVICE, "isVoNrEnabled", e, serial);
+                 }
+             }
+         } else {
+@@ -3110,10 +3181,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                     riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+                 }
+ 
++                final int serial = rr.mSerial;
+                 try {
+-                    voiceProxy.setVoNrEnabled(rr.mSerial, enabled);
++                    voiceProxy.setVoNrEnabled(serial, enabled);
+                 } catch (RemoteException | RuntimeException e) {
+-                    handleRadioProxyExceptionForRR(VOICE_SERVICE, "setVoNrEnabled", e);
++                    handleRadioProxyExceptionForRR(VOICE_SERVICE, "setVoNrEnabled", e, serial);
+                 }
+             }
+         } else {
+@@ -3142,10 +3214,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " cdmaSubscription = " + cdmaSubscription);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setCdmaSubscriptionSource(rr.mSerial, cdmaSubscription);
++                simProxy.setCdmaSubscriptionSource(serial, cdmaSubscription);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setCdmaSubscriptionSource", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setCdmaSubscriptionSource", e, serial);
+             }
+         }
+     }
+@@ -3161,10 +3234,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getCdmaRoamingPreference(rr.mSerial);
++                networkProxy.getCdmaRoamingPreference(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "queryCdmaRoamingPreference", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "queryCdmaRoamingPreference", e, serial);
+             }
+         }
+     }
+@@ -3181,10 +3255,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " cdmaRoamingType = " + cdmaRoamingType);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setCdmaRoamingPreference(rr.mSerial, cdmaRoamingType);
++                networkProxy.setCdmaRoamingPreference(serial, cdmaRoamingType);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setCdmaRoamingPreference", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setCdmaRoamingPreference", e, serial);
+             }
+         }
+     }
+@@ -3200,10 +3275,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getTtyMode(rr.mSerial);
++                voiceProxy.getTtyMode(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getTtyMode", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getTtyMode", e, serial);
+             }
+         }
+     }
+@@ -3219,10 +3295,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " ttyMode = " + ttyMode);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.setTtyMode(rr.mSerial, ttyMode);
++                voiceProxy.setTtyMode(serial, ttyMode);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setTtyMode", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setTtyMode", e, serial);
+             }
+         }
+     }
+@@ -3239,10 +3316,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " enable = " + enable);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.setPreferredVoicePrivacy(rr.mSerial, enable);
++                voiceProxy.setPreferredVoicePrivacy(serial, enable);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setPreferredVoicePrivacy", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "setPreferredVoicePrivacy", e, serial);
+             }
+         }
+     }
+@@ -3258,10 +3336,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.getPreferredVoicePrivacy(rr.mSerial);
++                voiceProxy.getPreferredVoicePrivacy(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getPreferredVoicePrivacy", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "getPreferredVoicePrivacy", e, serial);
+             }
+         }
+     }
+@@ -3277,11 +3356,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " featureCode = " + Rlog.pii(RILJ_LOG_TAG, featureCode));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.sendCdmaFeatureCode(rr.mSerial,
++                voiceProxy.sendCdmaFeatureCode(serial,
+                         RILUtils.convertNullToEmptyString(featureCode));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendCdmaFeatureCode", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendCdmaFeatureCode", e, serial);
+             }
+         }
+     }
+@@ -3298,11 +3378,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " dtmfString = " + dtmfString + " on = " + on + " off = " + off);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.sendBurstDtmf(rr.mSerial, RILUtils.convertNullToEmptyString(dtmfString),
++                voiceProxy.sendBurstDtmf(serial, RILUtils.convertNullToEmptyString(dtmfString),
+                         on, off);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendBurstDtmf", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "sendBurstDtmf", e, serial);
+             }
+         }
+     }
+@@ -3320,15 +3401,16 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendCdmaSmsExpectMore(rr.mSerial, pdu);
++                messagingProxy.sendCdmaSmsExpectMore(serial, pdu);
+                 if (mRadioVersion.greaterOrEqual(RADIO_HAL_VERSION_1_5)) {
+-                    mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_CDMA,
++                    mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_CDMA,
+                             SmsSession.Event.Format.SMS_FORMAT_3GPP2,
+                             getOutgoingSmsMessageId(result));
+                 }
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendCdmaSMSExpectMore", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendCdmaSMSExpectMore", e, serial);
+             }
+         }
+     }
+@@ -3345,12 +3427,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendCdmaSms(rr.mSerial, pdu);
+-                mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_CDMA,
++                messagingProxy.sendCdmaSms(serial, pdu);
++                mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_CDMA,
+                         SmsSession.Event.Format.SMS_FORMAT_3GPP2, getOutgoingSmsMessageId(result));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendCdmaSms", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendCdmaSms", e, serial);
+             }
+         }
+     }
+@@ -3368,11 +3451,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " success = " + success + " cause = " + cause);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.acknowledgeLastIncomingCdmaSms(rr.mSerial, success, cause);
++                messagingProxy.acknowledgeLastIncomingCdmaSms(serial, success, cause);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(MESSAGING_SERVICE,
+-                        "acknowledgeLastIncomingCdmaSms", e);
++                        "acknowledgeLastIncomingCdmaSms", e, serial);
+             }
+         }
+     }
+@@ -3389,10 +3473,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.getGsmBroadcastConfig(rr.mSerial);
++                messagingProxy.getGsmBroadcastConfig(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getGsmBroadcastConfig", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getGsmBroadcastConfig", e, serial);
+             }
+         }
+     }
+@@ -3413,10 +3498,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.setGsmBroadcastConfig(rr.mSerial, config);
++                messagingProxy.setGsmBroadcastConfig(serial, config);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setGsmBroadcastConfig", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setGsmBroadcastConfig", e, serial);
+             }
+         }
+     }
+@@ -3434,10 +3520,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " activate = " + activate);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.setGsmBroadcastActivation(rr.mSerial, activate);
++                messagingProxy.setGsmBroadcastActivation(serial, activate);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setGsmBroadcastActivation", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setGsmBroadcastActivation", e, serial);
+             }
+         }
+     }
+@@ -3454,10 +3541,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.getCdmaBroadcastConfig(rr.mSerial);
++                messagingProxy.getCdmaBroadcastConfig(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getCdmaBroadcastConfig", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getCdmaBroadcastConfig", e, serial);
+             }
+         }
+     }
+@@ -3478,10 +3566,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.setCdmaBroadcastConfig(rr.mSerial, configs);
++                messagingProxy.setCdmaBroadcastConfig(serial, configs);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setCdmaBroadcastConfig", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setCdmaBroadcastConfig", e, serial);
+             }
+         }
+     }
+@@ -3499,10 +3588,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " activate = " + activate);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.setCdmaBroadcastActivation(rr.mSerial, activate);
++                messagingProxy.setCdmaBroadcastActivation(serial, activate);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setCdmaBroadcastActivation", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setCdmaBroadcastActivation", e, serial);
+             }
+         }
+     }
+@@ -3518,10 +3608,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getCdmaSubscription(rr.mSerial);
++                simProxy.getCdmaSubscription(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getCdmaSubscription", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getCdmaSubscription", e, serial);
+             }
+         }
+     }
+@@ -3539,10 +3630,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " status = " + status);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.writeSmsToRuim(rr.mSerial, status, pdu);
++                messagingProxy.writeSmsToRuim(serial, status, pdu);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "writeSmsToRuim", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "writeSmsToRuim", e, serial);
+             }
+         }
+     }
+@@ -3560,10 +3652,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " index = " + index);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.deleteSmsOnRuim(rr.mSerial, index);
++                messagingProxy.deleteSmsOnRuim(serial, index);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "deleteSmsOnRuim", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "deleteSmsOnRuim", e, serial);
+             }
+         }
+     }
+@@ -3579,10 +3672,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getDeviceIdentity(rr.mSerial);
++                modemProxy.getDeviceIdentity(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getDeviceIdentity", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getDeviceIdentity", e, serial);
+             }
+         }
+     }
+@@ -3598,10 +3692,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.exitEmergencyCallbackMode(rr.mSerial);
++                voiceProxy.exitEmergencyCallbackMode(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(VOICE_SERVICE, "exitEmergencyCallbackMode", e);
++                handleRadioProxyExceptionForRR(VOICE_SERVICE, "exitEmergencyCallbackMode", e, serial);
+             }
+         }
+     }
+@@ -3618,10 +3713,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.getSmscAddress(rr.mSerial);
++                messagingProxy.getSmscAddress(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getSmscAddress", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "getSmscAddress", e, serial);
+             }
+         }
+     }
+@@ -3639,11 +3735,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " address = " + address);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.setSmscAddress(rr.mSerial,
++                messagingProxy.setSmscAddress(serial,
+                         RILUtils.convertNullToEmptyString(address));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setSmscAddress", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "setSmscAddress", e, serial);
+             }
+         }
+     }
+@@ -3661,10 +3758,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " available = " + available);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.reportSmsMemoryStatus(rr.mSerial, available);
++                messagingProxy.reportSmsMemoryStatus(serial, available);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "reportSmsMemoryStatus", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "reportSmsMemoryStatus", e, serial);
+             }
+         }
+     }
+@@ -3680,10 +3778,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.reportStkServiceIsRunning(rr.mSerial);
++                simProxy.reportStkServiceIsRunning(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "reportStkServiceIsRunning", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "reportStkServiceIsRunning", e, serial);
+             }
+         }
+     }
+@@ -3699,10 +3798,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getCdmaSubscriptionSource(rr.mSerial);
++                simProxy.getCdmaSubscriptionSource(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getCdmaSubscriptionSource", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getCdmaSubscriptionSource", e, serial);
+             }
+         }
+     }
+@@ -3720,12 +3820,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " success = " + success);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.acknowledgeIncomingGsmSmsWithPdu(rr.mSerial, success,
++                messagingProxy.acknowledgeIncomingGsmSmsWithPdu(serial, success,
+                         RILUtils.convertNullToEmptyString(ackPdu));
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(MESSAGING_SERVICE,
+-                        "acknowledgeIncomingGsmSmsWithPdu", e);
++                        "acknowledgeIncomingGsmSmsWithPdu", e, serial);
+             }
+         }
+     }
+@@ -3741,10 +3842,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getVoiceRadioTechnology(rr.mSerial);
++                networkProxy.getVoiceRadioTechnology(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getVoiceRadioTechnology", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getVoiceRadioTechnology", e, serial);
+             }
+         }
+     }
+@@ -3760,10 +3862,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getCellInfoList(rr.mSerial);
++                networkProxy.getCellInfoList(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getCellInfoList", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getCellInfoList", e, serial);
+             }
+         }
+     }
+@@ -3780,10 +3883,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " rateInMillis = " + rateInMillis);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setCellInfoListRate(rr.mSerial, rateInMillis);
++                networkProxy.setCellInfoListRate(serial, rateInMillis);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setCellInfoListRate", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setCellInfoListRate", e, serial);
+             }
+         }
+     }
+@@ -3800,10 +3904,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + dataProfile);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.setInitialAttachApn(rr.mSerial, dataProfile, isRoaming);
++                dataProxy.setInitialAttachApn(serial, dataProfile, isRoaming);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "setInitialAttachApn", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "setInitialAttachApn", e, serial);
+             }
+         }
+     }
+@@ -3819,10 +3924,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getImsRegistrationState(rr.mSerial);
++                networkProxy.getImsRegistrationState(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getImsRegistrationState", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getImsRegistrationState", e, serial);
+             }
+         }
+     }
+@@ -3840,12 +3946,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendImsSms(rr.mSerial, smscPdu, pdu, null, retry, messageRef);
+-                mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_IMS,
++                messagingProxy.sendImsSms(serial, smscPdu, pdu, null, retry, messageRef);
++                mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_IMS,
+                         SmsSession.Event.Format.SMS_FORMAT_3GPP, getOutgoingSmsMessageId(result));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendImsGsmSms", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendImsGsmSms", e, serial);
+             }
+         }
+     }
+@@ -3862,12 +3969,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                messagingProxy.sendImsSms(rr.mSerial, null, null, pdu, retry, messageRef);
+-                mMetrics.writeRilSendSms(mPhoneId, rr.mSerial, SmsSession.Event.Tech.SMS_IMS,
++                messagingProxy.sendImsSms(serial, null, null, pdu, retry, messageRef);
++                mMetrics.writeRilSendSms(mPhoneId, serial, SmsSession.Event.Tech.SMS_IMS,
+                         SmsSession.Event.Format.SMS_FORMAT_3GPP2, getOutgoingSmsMessageId(result));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendImsCdmaSms", e);
++                handleRadioProxyExceptionForRR(MESSAGING_SERVICE, "sendImsCdmaSms", e, serial);
+             }
+         }
+     }
+@@ -3891,11 +3999,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+                 simProxy.iccTransmitApduBasicChannel(
+-                        rr.mSerial, cla, instruction, p1, p2, p3, data);
++                        serial, cla, instruction, p1, p2, p3, data);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccTransmitApduBasicChannel", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccTransmitApduBasicChannel", e, serial);
+             }
+         }
+     }
+@@ -3916,11 +4025,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.iccOpenLogicalChannel(rr.mSerial, RILUtils.convertNullToEmptyString(aid),
++                simProxy.iccOpenLogicalChannel(serial, RILUtils.convertNullToEmptyString(aid),
+                         p2);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccOpenLogicalChannel", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccOpenLogicalChannel", e, serial);
+             }
+         }
+     }
+@@ -3937,10 +4047,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " channel = " + channel);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.iccCloseLogicalChannel(rr.mSerial, channel);
++                simProxy.iccCloseLogicalChannel(serial, channel);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccCloseLogicalChannel", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccCloseLogicalChannel", e, serial);
+             }
+         }
+     }
+@@ -3970,11 +4081,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+                 simProxy.iccTransmitApduLogicalChannel(
+-                        rr.mSerial, channel, cla, instruction, p1, p2, p3, data);
++                        serial, channel, cla, instruction, p1, p2, p3, data);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccTransmitApduLogicalChannel", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "iccTransmitApduLogicalChannel", e, serial);
+             }
+         }
+     }
+@@ -3991,10 +4103,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " itemId = " + itemID);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.nvReadItem(rr.mSerial, itemID);
++                modemProxy.nvReadItem(serial, itemID);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvReadItem", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvReadItem", e, serial);
+             }
+         }
+     }
+@@ -4011,11 +4124,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " itemId = " + itemId + " itemValue = " + itemValue);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.nvWriteItem(rr.mSerial, itemId,
++                modemProxy.nvWriteItem(serial, itemId,
+                         RILUtils.convertNullToEmptyString(itemValue));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvWriteItem", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvWriteItem", e, serial);
+             }
+         }
+     }
+@@ -4033,10 +4147,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + IccUtils.bytesToHexString(preferredRoamingList));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.nvWriteCdmaPrl(rr.mSerial, preferredRoamingList);
++                modemProxy.nvWriteCdmaPrl(serial, preferredRoamingList);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvWriteCdmaPrl", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvWriteCdmaPrl", e, serial);
+             }
+         }
+     }
+@@ -4053,10 +4168,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " resetType = " + resetType);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.nvResetConfig(rr.mSerial, resetType);
++                modemProxy.nvResetConfig(serial, resetType);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvResetConfig", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "nvResetConfig", e, serial);
+             }
+         }
+     }
+@@ -4075,10 +4191,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " subId = " + subId + " subStatus = " + subStatus);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setUiccSubscription(rr.mSerial, slotId, appIndex, subId, subStatus);
++                simProxy.setUiccSubscription(serial, slotId, appIndex, subId, subStatus);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setUiccSubscription", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setUiccSubscription", e, serial);
+             }
+         }
+     }
+@@ -4107,10 +4224,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " allowed = " + allowed);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.setDataAllowed(rr.mSerial, allowed);
++                dataProxy.setDataAllowed(serial, allowed);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataAllowed", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataAllowed", e, serial);
+             }
+         }
+     }
+@@ -4127,10 +4245,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getHardwareConfig(rr.mSerial);
++                modemProxy.getHardwareConfig(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getHardwareConfig", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getHardwareConfig", e, serial);
+             }
+         }
+     }
+@@ -4148,12 +4267,13 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.requestIccSimAuthentication(rr.mSerial, authContext,
++                simProxy.requestIccSimAuthentication(serial, authContext,
+                         RILUtils.convertNullToEmptyString(data),
+                         RILUtils.convertNullToEmptyString(aid));
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "requestIccSimAuthentication", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "requestIccSimAuthentication", e, serial);
+             }
+         }
+     }
+@@ -4173,10 +4293,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 }
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.setDataProfile(rr.mSerial, dps, isRoaming);
++                dataProxy.setDataProfile(serial, dps, isRoaming);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataProfile", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataProfile", e, serial);
+             }
+         }
+     }
+@@ -4191,10 +4312,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.requestShutdown(rr.mSerial);
++                modemProxy.requestShutdown(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "requestShutdown", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "requestShutdown", e, serial);
+             }
+         }
+     }
+@@ -4210,10 +4332,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getRadioCapability(rr.mSerial);
++                modemProxy.getRadioCapability(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getRadioCapability", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getRadioCapability", e, serial);
+             }
+         }
+     }
+@@ -4230,10 +4353,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " RadioCapability = " + rc.toString());
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.setRadioCapability(rr.mSerial, rc);
++                modemProxy.setRadioCapability(serial, rc);
+             } catch (Exception e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "setRadioCapability", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "setRadioCapability", e, serial);
+             }
+         }
+     }
+@@ -4261,10 +4385,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " reportIntervalMs = " + reportIntervalMs + " pullMode = " + pullMode);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                radioProxy.startLceService(rr.mSerial, reportIntervalMs, pullMode);
++                radioProxy.startLceService(serial, reportIntervalMs, pullMode);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(RADIO_SERVICE, "startLceService", e);
++                handleRadioProxyExceptionForRR(RADIO_SERVICE, "startLceService", e, serial);
+             }
+         }
+     }
+@@ -4291,10 +4416,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                radioProxy.stopLceService(rr.mSerial);
++                radioProxy.stopLceService(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(RADIO_SERVICE, "stopLceService", e);
++                handleRadioProxyExceptionForRR(RADIO_SERVICE, "stopLceService", e, serial);
+             }
+         }
+     }
+@@ -4324,11 +4450,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " completionWindowMillis " + completionWindowMillis);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.setDataThrottling(rr.mSerial, (byte) dataThrottlingAction,
++                dataProxy.setDataThrottling(serial, (byte) dataThrottlingAction,
+                         completionWindowMillis);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataThrottling", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "setDataThrottling", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "setDataThrottling: REQUEST_NOT_SUPPORTED");
+@@ -4373,10 +4500,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                radioProxy.pullLceData(rr.mSerial);
++                radioProxy.pullLceData(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(RADIO_SERVICE, "pullLceData", e);
++                handleRadioProxyExceptionForRR(RADIO_SERVICE, "pullLceData", e, serial);
+             }
+         }
+     }
+@@ -4392,13 +4520,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.getModemActivityInfo(rr.mSerial);
++                modemProxy.getModemActivityInfo(serial);
+                 Message msg =
+-                        mRilHandler.obtainMessage(EVENT_BLOCKING_RESPONSE_TIMEOUT, rr.mSerial);
++                        mRilHandler.obtainMessage(EVENT_BLOCKING_RESPONSE_TIMEOUT, serial);
+                 mRilHandler.sendMessageDelayed(msg, DEFAULT_BLOCKING_MESSAGE_RESPONSE_TIMEOUT_MS);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getModemActivityInfo", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "getModemActivityInfo", e, serial);
+             }
+         }
+     }
+@@ -4418,10 +4547,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " params: " + carrierRestrictionRules);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setAllowedCarriers(rr.mSerial, carrierRestrictionRules, result);
++                simProxy.setAllowedCarriers(serial, carrierRestrictionRules, result);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setAllowedCarriers", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setAllowedCarriers", e, serial);
+             }
+         }
+     }
+@@ -4437,10 +4567,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getAllowedCarriers(rr.mSerial);
++                simProxy.getAllowedCarriers(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getAllowedCarriers", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getAllowedCarriers", e, serial);
+             }
+         }
+     }
+@@ -4457,10 +4588,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + stateType + ":" + state);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                modemProxy.sendDeviceState(rr.mSerial, stateType, state);
++                modemProxy.sendDeviceState(serial, stateType, state);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(MODEM_SERVICE, "sendDeviceState", e);
++                handleRadioProxyExceptionForRR(MODEM_SERVICE, "sendDeviceState", e, serial);
+             }
+         }
+     }
+@@ -4477,10 +4609,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " " + filter);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setIndicationFilter(rr.mSerial, filter);
++                networkProxy.setIndicationFilter(serial, filter);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setIndicationFilter", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setIndicationFilter", e, serial);
+             }
+         }
+     }
+@@ -4498,11 +4631,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setSignalStrengthReportingCriteria(rr.mSerial, signalThresholdInfos);
++                networkProxy.setSignalStrengthReportingCriteria(serial, signalThresholdInfos);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(NETWORK_SERVICE,
+-                        "setSignalStrengthReportingCriteria", e);
++                        "setSignalStrengthReportingCriteria", e, serial);
+             }
+         } else {
+             riljLoge("setSignalStrengthReportingCriteria ignored on IRadio version less than 1.2");
+@@ -4523,13 +4657,14 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setLinkCapacityReportingCriteria(rr.mSerial, hysteresisMs,
++                networkProxy.setLinkCapacityReportingCriteria(serial, hysteresisMs,
+                         hysteresisDlKbps, hysteresisUlKbps, thresholdsDlKbps, thresholdsUlKbps,
+                         ran);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(
+-                        NETWORK_SERVICE, "setLinkCapacityReportingCriteria", e);
++                        NETWORK_SERVICE, "setLinkCapacityReportingCriteria", e, serial);
+             }
+         } else {
+             riljLoge("setLinkCapacityReportingCriteria ignored on IRadio version less than 1.2");
+@@ -4548,10 +4683,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " " + state);
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setSimCardPower(rr.mSerial, state, result);
++                simProxy.setSimCardPower(serial, state, result);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setSimCardPower", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setSimCardPower", e, serial);
+             }
+         }
+     }
+@@ -4569,10 +4705,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.setCarrierInfoForImsiEncryption(rr.mSerial, imsiEncryptionInfo);
++                simProxy.setCarrierInfoForImsiEncryption(serial, imsiEncryptionInfo);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "setCarrierInfoForImsiEncryption", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "setCarrierInfoForImsiEncryption", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -4600,10 +4737,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.startKeepalive(rr.mSerial, contextId, packetData, intervalMillis, result);
++                dataProxy.startKeepalive(serial, contextId, packetData, intervalMillis, result);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "startNattKeepalive", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "startNattKeepalive", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "startNattKeepalive: REQUEST_NOT_SUPPORTED");
+@@ -4627,10 +4765,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.stopKeepalive(rr.mSerial, sessionHandle);
++                dataProxy.stopKeepalive(serial, sessionHandle);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "stopNattKeepalive", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "stopNattKeepalive", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "stopNattKeepalive: REQUEST_NOT_SUPPORTED");
+@@ -4687,10 +4826,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.enableUiccApplications(rr.mSerial, enable);
++                simProxy.enableUiccApplications(serial, enable);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "enableUiccApplications", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "enableUiccApplications", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "enableUiccApplications: REQUEST_NOT_SUPPORTED");
+@@ -4719,10 +4859,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.areUiccApplicationsEnabled(rr.mSerial);
++                simProxy.areUiccApplicationsEnabled(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "areUiccApplicationsEnabled", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "areUiccApplicationsEnabled", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -4764,11 +4905,12 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                voiceProxy.handleStkCallSetupRequestFromSim(rr.mSerial, accept);
++                voiceProxy.handleStkCallSetupRequestFromSim(serial, accept);
+             } catch (RemoteException | RuntimeException e) {
+                 handleRadioProxyExceptionForRR(
+-                        VOICE_SERVICE, "handleStkCallSetupRequestFromSim", e);
++                        VOICE_SERVICE, "handleStkCallSetupRequestFromSim", e, serial);
+             }
+         }
+     }
+@@ -4788,10 +4930,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getBarringInfo(rr.mSerial);
++                networkProxy.getBarringInfo(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getBarringInfo", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getBarringInfo", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "getBarringInfo: REQUEST_NOT_SUPPORTED");
+@@ -4817,10 +4960,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.allocatePduSessionId(rr.mSerial);
++                dataProxy.allocatePduSessionId(serial);
+             } catch (RemoteException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "allocatePduSessionId", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "allocatePduSessionId", e, serial);
+             }
+         } else {
+             AsyncResult.forMessage(result, null,
+@@ -4843,10 +4987,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.releasePduSessionId(rr.mSerial, pduSessionId);
++                dataProxy.releasePduSessionId(serial, pduSessionId);
+             } catch (RemoteException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "releasePduSessionId", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "releasePduSessionId", e, serial);
+             }
+         } else {
+             AsyncResult.forMessage(result, null,
+@@ -4869,10 +5014,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.startHandover(rr.mSerial, callId);
++                dataProxy.startHandover(serial, callId);
+             } catch (RemoteException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "startHandover", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "startHandover", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "startHandover: REQUEST_NOT_SUPPORTED");
+@@ -4898,10 +5044,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.cancelHandover(rr.mSerial, callId);
++                dataProxy.cancelHandover(serial, callId);
+             } catch (RemoteException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "cancelHandover", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "cancelHandover", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "cancelHandover: REQUEST_NOT_SUPPORTED");
+@@ -4926,10 +5073,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                dataProxy.getSlicingConfig(rr.mSerial);
++                dataProxy.getSlicingConfig(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(DATA_SERVICE, "getSlicingConfig", e);
++                handleRadioProxyExceptionForRR(DATA_SERVICE, "getSlicingConfig", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) Rlog.d(RILJ_LOG_TAG, "getSlicingConfig: REQUEST_NOT_SUPPORTED");
+@@ -4951,10 +5099,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getSimPhonebookRecords(rr.mSerial);
++                simProxy.getSimPhonebookRecords(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getSimPhonebookRecords", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getSimPhonebookRecords", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -4980,10 +5129,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.getSimPhonebookCapacity(rr.mSerial);
++                simProxy.getSimPhonebookCapacity(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "getSimPhonebookCapacity", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "getSimPhonebookCapacity", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -5010,10 +5160,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                         + " with " + phonebookRecord.toString());
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                simProxy.updateSimPhonebookRecords(rr.mSerial, phonebookRecord);
++                simProxy.updateSimPhonebookRecords(serial, phonebookRecord);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(SIM_SERVICE, "updateSimPhonebookRecords", e);
++                handleRadioProxyExceptionForRR(SIM_SERVICE, "updateSimPhonebookRecords", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -5046,10 +5197,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.setUsageSetting(rr.mSerial, usageSetting);
++                networkProxy.setUsageSetting(serial, usageSetting);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setUsageSetting", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "setUsageSetting", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -5080,10 +5232,11 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 riljLog(rr.serialString() + "> " + RILUtils.requestToString(rr.mRequest));
+             }
+ 
++            final int serial = rr.mSerial;
+             try {
+-                networkProxy.getUsageSetting(rr.mSerial);
++                networkProxy.getUsageSetting(serial);
+             } catch (RemoteException | RuntimeException e) {
+-                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getUsageSetting", e);
++                handleRadioProxyExceptionForRR(NETWORK_SERVICE, "getUsageSetting", e, serial);
+             }
+         } else {
+             if (RILJ_LOGD) {
+@@ -5370,7 +5523,7 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 try {
+                     radioProxy.responseAcknowledgement();
+                 } catch (RemoteException | RuntimeException e) {
+-                    handleRadioProxyExceptionForRR(RADIO_SERVICE, "sendAck", e);
++                    handleRadioProxyExceptionForRR(RADIO_SERVICE, "sendAck", e, -1);
+                     riljLoge("sendAck: " + e);
+                 }
+             } else {
+@@ -5382,7 +5535,7 @@ public class RIL extends BaseCommands implements CommandsInterface {
+                 try {
+                     serviceProxy.responseAcknowledgement();
+                 } catch (RemoteException | RuntimeException e) {
+-                    handleRadioProxyExceptionForRR(service, "sendAck", e);
++                    handleRadioProxyExceptionForRR(service, "sendAck", e, -1);
+                     riljLoge("sendAck: " + e);
+                 }
+             } else {
+diff --git a/src/java/com/android/internal/telephony/SubscriptionController.java b/src/java/com/android/internal/telephony/SubscriptionController.java
+index 82799bea8b..f8c7b9f80d 100644
+--- a/src/java/com/android/internal/telephony/SubscriptionController.java
++++ b/src/java/com/android/internal/telephony/SubscriptionController.java
+@@ -2403,6 +2403,10 @@ public class SubscriptionController extends ISub.Stub {
+      * @return the number of records updated
+      */
+     public int setMccMnc(String mccMnc, int subId) {
++        if (!SubscriptionManager.isValidSubscriptionId(subId)) {
++            loge("[setMccMnc] - invalid subId: " + subId);
++            return 0;
++        }
+         String mccString = mccMnc.substring(0, 3);
+         String mncString = mccMnc.substring(3);
+         int mcc = 0;
+@@ -2573,6 +2577,10 @@ public class SubscriptionController extends ISub.Stub {
+      */
+     public int setCountryIso(String iso, int subId) {
+         if (DBG) logd("[setCountryIso]+ iso:" + iso + " subId:" + subId);
++        if (!SubscriptionManager.isValidSubscriptionId(subId)) {
++            loge("[setCountryIso] - invalid subId: " + subId);
++            return 0;
++        }
+         boolean update = true;
+         int result = 0;
+         SubscriptionInfo subInfo = getSubscriptionInfo(subId);
+diff --git a/src/java/com/android/internal/telephony/data/CellularDataService.java b/src/java/com/android/internal/telephony/data/CellularDataService.java
+index c5923aae01..7d03433404 100644
+--- a/src/java/com/android/internal/telephony/data/CellularDataService.java
++++ b/src/java/com/android/internal/telephony/data/CellularDataService.java
+@@ -24,6 +24,7 @@ import android.os.AsyncResult;
+ import android.os.Handler;
+ import android.os.Looper;
+ import android.os.Message;
++import android.telephony.DataFailCause;
+ import android.telephony.SubscriptionManager;
+ import android.telephony.data.DataCallResponse;
+ import android.telephony.data.DataProfile;
+@@ -32,6 +33,7 @@ import android.telephony.data.DataServiceCallback;
+ import android.telephony.data.NetworkSliceInfo;
+ import android.telephony.data.TrafficDescriptor;
+ 
++import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.telephony.CommandException;
+ import com.android.internal.telephony.Phone;
+ import com.android.internal.telephony.PhoneFactory;
+@@ -83,10 +85,14 @@ public class CellularDataService extends DataService {
+                     switch (message.what) {
+                         case SETUP_DATA_CALL_COMPLETE:
+                             DataCallResponse response = (DataCallResponse) ar.result;
+-                            callback.onSetupDataCallComplete(ar.exception != null
+-                                    ? DataServiceCallback.RESULT_ERROR_ILLEGAL_STATE
+-                                    : RESULT_SUCCESS,
+-                                    response);
++                            int resultCode = getSetupDataCallResultCode(ar.exception, response);
++                            // Ignore an empty error response, including its default retry time
++                            // of zero, so that the framework uses its normal retry backoff.
++                            if (resultCode
++                                    == DataServiceCallback.RESULT_ERROR_TEMPORARILY_UNAVAILABLE) {
++                                response = null;
++                            }
++                            callback.onSetupDataCallComplete(resultCode, response);
+                             break;
+                         case DEACTIVATE_DATA_CALL_COMPLETE:
+                             callback.onDeactivateDataCallComplete(ar.exception != null
+@@ -274,6 +280,29 @@ public class CellularDataService extends DataService {
+         }
+     }
+ 
++    @VisibleForTesting
++    static @DataServiceCallback.ResultCode int getSetupDataCallResultCode(
++            @Nullable Throwable exception, @Nullable DataCallResponse response) {
++        if (exception == null) {
++            return RESULT_SUCCESS;
++        }
++        if (exception instanceof CommandException
++                && ((CommandException) exception).getCommandError()
++                == CommandException.Error.GENERIC_FAILURE) {
++            // Legacy RILs, including Huawei's, can return GENERIC_FAILURE together with
++            // a data failure response. Let DataNetwork use that cause and retry duration
++            // instead of replacing it with RADIO_NOT_AVAILABLE and disabling APN retries.
++            // RESULT_SUCCESS means the response is available, not that data is connected.
++            if (response != null && response.getCause() != DataFailCause.NONE) {
++                return RESULT_SUCCESS;
++            }
++            // A generic error without a failure cause must not look like a successful
++            // connection, even if the RIL supplied a default response with cause NONE.
++            return DataServiceCallback.RESULT_ERROR_TEMPORARILY_UNAVAILABLE;
++        }
++        return DataServiceCallback.RESULT_ERROR_ILLEGAL_STATE;
++    }
++
+     @Override
+     public DataServiceProvider onCreateDataServiceProvider(int slotIndex) {
+         log("Cellular data service created for slot " + slotIndex);

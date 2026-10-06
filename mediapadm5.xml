@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <project path="device/huawei/compat"
+             name="Huawei-Dev/android_device_huawei_compat"
+             remote="github"
+             revision="android@13" />
+
+    <project path="kernel/huawei/hi3660"
+             name="Huawei-Dev/android_kernel_huawei_hi3660"
+             remote="github"
+             revision="los20" />
+
+    <project path="device/huawei/hi3660"
+             name="Huawei-Dev/android_device_huawei_hi3660"
+             remote="private"
+             revision="android@13" />
+
+    <project path="device/huawei/mediapadm5lte"
+             name="Huawei-Dev/android_device_huawei_mediapadm5lte"
+             remote="private"
+             revision="android@13" />
+
+    <project path="vendor/huawei/hi3660"
+             name="Huawei-Dev/android_vendor_huawei_hi3660"
+             remote="private"
+             revision="android@13" />
+
+    <project path="vendor/huawei/mediapadm5lte"
+             name="Huawei-Dev/android_vendor_huawei_mediapadm5lte"
+             remote="private"
+             revision="android@13" />
+</manifest>
