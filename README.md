@@ -11,5 +11,5 @@ git apply frameworks-opt-telephony-radio-recovery.patch
 
 ```bash
 cd packages/apps/SecureElement
-git apply /home/icarusradio/android/lineage/SecureElement-Terminal-hal-callback.patch
+git apply SecureElement-Terminal-hal-callback.patch
 ```
